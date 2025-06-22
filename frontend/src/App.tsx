@@ -1,4 +1,5 @@
 import React from "react";
+import ASLRecognizer from "./components/ASLRecognizer";
 
 function App() {
   return (
@@ -6,7 +7,7 @@ function App() {
       <div className="container mx-auto px-4 py-8">
         <header className="text-center mb-12">
           <h1 className="text-4xl font-bold text-gray-900 mb-4">
-            Welcome to Berkeley25
+            Welcome to My ASLApp
           </h1>
           <p className="text-xl text-gray-600">
             A modern React + TypeScript + Tailwind CSS application
@@ -14,6 +15,11 @@ function App() {
         </header>
 
         <main className="max-w-4xl mx-auto">
+        <section className="mt-12">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Try Signing 👋</h2>
+          <ASLRecognizer />
+        </section>
+          
           <div className="bg-white rounded-lg shadow-lg p-8">
             <h2 className="text-2xl font-semibold text-gray-800 mb-6">
               Getting Started
