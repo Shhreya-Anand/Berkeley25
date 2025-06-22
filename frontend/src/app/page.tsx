@@ -303,7 +303,7 @@ export default function Home() {
     }
 
     const rec = new SpeechRecognition();
-    rec.continuous = true;
+    rec.continuous = false;
     rec.interimResults = true;
     rec.lang = "en-US";
     recognitionRef.current = rec;
@@ -342,6 +342,12 @@ export default function Home() {
           sendToClaude(finalText, currentMsgId!);
           lastUtteranceRef.current = finalText;
         }
+
+        // Stop recognition – onend handler will update `isListening`.
+        try {
+          rec.stop();
+        } catch (_) {}
+
         currentMsgId = null;
       }
     };
@@ -349,23 +355,22 @@ export default function Home() {
     rec.onerror = (err: any) => {
       console.error("Speech recog error", err);
       setIsListening(false);
+      if (err?.error === "not-allowed" || err?.name === "NotAllowedError") {
+        setError(
+          "Microphone access was blocked. Please click the padlock icon in your browser's address bar, allow microphone permissions for this site, then click 'Start Mic' again."
+        );
+      }
     };
 
     rec.onstart = () => setIsListening(true);
     rec.onend = () => {
+      // Recognition has fully stopped (either naturally after the utterance
+      // or via rec.stop/abort). Just update UI state; user must press the
+      // mic button again to start a new request.
       setIsListening(false);
-      // Auto-restart if assistant is not speaking
-      if (!isSpeaking) {
-        try {
-          rec.start();
-        } catch (_) {}
-      }
     };
 
-    // Start listening initially (after permission prompt)
-    try {
-      rec.start();
-    } catch (_) {}
+    // Do not auto-start listening; the user will press the mic button when ready.
 
     return () => {
       rec.abort();
@@ -378,12 +383,30 @@ export default function Home() {
     if (!rec) return;
     try {
       if (isSpeaking) {
-        if (rec) rec.abort();
-      } else if (!isListening) {
-        rec.start();
+        rec.abort();
       }
     } catch (_) {}
   }, [isSpeaking]);
+
+  const toggleListening = () => {
+    const rec: any = recognitionRef.current;
+    if (!rec) return;
+    try {
+      if (isListening) {
+        rec.abort();
+        setIsListening(false);
+      } else {
+        rec.start();
+        // onstart handler will update state, but set a fallback
+        setIsListening(true);
+      }
+    } catch (err) {
+      console.error("Speech recog start error", err);
+      setError(
+        "Unable to access microphone – please allow permissions and use a supported browser (e.g. Chrome on desktop)."
+      );
+    }
+  };
 
   return (
     <main className="container mx-auto max-w-5xl py-10 space-y-10 relative">
@@ -472,6 +495,13 @@ export default function Home() {
                 {isListening && (
                   <span className="text-sm text-gray-500 self-center mr-2">Listening…</span>
                 )}
+                <Button
+                  variant="outline"
+                  onClick={toggleListening}
+                  disabled={isSpeaking}
+                >
+                  {isListening ? "Stop Mic" : "Start Mic"}
+                </Button>
                 <Button onClick={askClaude} disabled={loadingClaude}>
                   {loadingClaude ? "Sending..." : "Send"}
                 </Button>
