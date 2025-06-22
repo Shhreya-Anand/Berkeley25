@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-// @ts-ignore -- Vapi has no TS types yet
-import Vapi from "@vapi-ai/web";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 
 interface EmotionScore {
   name: string;
@@ -21,109 +22,65 @@ export default function Home() {
   const [claudeReply, setClaudeReply] = useState<string | null>(null);
   const [loadingClaude, setLoadingClaude] = useState(false);
 
-  // Track Vapi speaking state for interrupt button
+  // Speaking / listening state
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false); // whether microphone is active
+  const [volumeLevel, setVolumeLevel] = useState(0);
 
-  // Vapi reference
-  const vapiRef = useRef<any>(null);
+  // Ref to the currently playing audio element so we can stop it
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // AudioContext for volume analyzer
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // Init Vapi once in browser
+  // Rolling chat + captions
+  const captionIdRef = useRef(0);
+  const [chat, setChat] = useState<
+    { id: number; role: "assistant" | "user"; text: string }[]
+  >([]);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const lastAssistantTextRef = useRef<string>("");
+
+  // Auto-scroll to bottom when chat updates
   useEffect(() => {
-    const pubKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
-    const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
-
-    if (!pubKey || !assistantId) return; // skip if env vars missing
-
-    const v = new Vapi(pubKey);
-    vapiRef.current = v;
-
-    // Start persistent call so we can stream "say" later
-    v.start(assistantId);
-
-    // Wire speech events to toggle isSpeaking
-    v.on("speech-start", () => setIsSpeaking(true));
-    v.on("speech-end", () => setIsSpeaking(false));
-
-    return () => {
-      try {
-        v.stop();
-        setIsSpeaking(false);
-      } catch (_) {
-        /* no-op */
-      }
-    };
-  }, []);
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat]);
 
   // Ask for webcam on mount
   useEffect(() => {
     let localStream: MediaStream;
 
-    const apiKey = process.env.NEXT_PUBLIC_HUME_API_KEY;
-
-    const startStreaming = () => {
-      if (!apiKey) {
-        setError("Missing NEXT_PUBLIC_HUME_API_KEY env var.");
-        return;
-      }
-
+    const startEmotionPolling = () => {
       if (!videoRef.current || !canvasRef.current) return;
 
-      const socket = new WebSocket(
-        `wss://api.hume.ai/v0/stream/models?apikey=${apiKey}`
-      );
-
-      socket.onopen = () => {
-        console.debug("Hume socket opened");
-      };
-
-      socket.onerror = (ev) => {
-        console.error("WS errored", ev);
-        setError("WebSocket connection error.");
-      };
-
-      socket.onmessage = (event) => {
-        console.debug("WS message", event.data);
-        try {
-          const data = JSON.parse(event.data);
-          const emotions: EmotionScore[] | undefined = data?.face?.predictions?.[0]?.emotions;
-          if (emotions) {
-            const top = [...emotions]
-              .sort((a, b) => b.score - a.score)
-              .slice(0, 3);
-            setTopEmotions(top);
-          }
-        } catch (_) {
-          /* swallow parse errors */
-        }
-      };
-
-      // Capture frames every 800 ms (≈1.25 fps)
-      const captureInterval = setInterval(() => {
+      // Capture frames every second
+      const captureInterval = setInterval(async () => {
         if (!videoRef.current || !canvasRef.current) return;
         const ctx = canvasRef.current.getContext("2d");
         if (!ctx) return;
 
-        // Draw current frame onto canvas (scale down for bandwidth)
         ctx.drawImage(videoRef.current, 0, 0, 320, 240);
         const jpegBase64 = canvasRef.current
           .toDataURL("image/jpeg", 0.7)
           .replace(/^data:image\/jpeg;base64,/, "");
 
-        if (socket.readyState === WebSocket.OPEN) {
-          const payload = {
-            data: jpegBase64,
-            models: { face: {} },
-          };
-          socket.send(JSON.stringify(payload));
-        } else {
-          console.debug("Socket not open, state", socket.readyState);
+        try {
+          const res = await fetch("/api/emotion", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ image: jpegBase64 }),
+          });
+          if (res.ok) {
+            const { emotions } = await res.json();
+            if (Array.isArray(emotions) && emotions.length) {
+              setTopEmotions(emotions);
+            }
+          }
+        } catch (_) {
+          /* network errors ignored */
         }
-      }, 800);
+      }, 1000);
 
-      return () => {
-        clearInterval(captureInterval);
-        socket.close();
-      };
+      return () => clearInterval(captureInterval);
     };
 
     const enableCamera = async () => {
@@ -133,22 +90,17 @@ export default function Home() {
           videoRef.current.srcObject = localStream;
 
           const maybeStart = () => {
-            // HAVE_CURRENT_DATA == 2
             if (videoRef.current && videoRef.current.readyState >= 2) {
-              startStreaming();
+              startEmotionPolling();
             }
           };
 
-          // If metadata already loaded (rare), start immediately, else wait.
           maybeStart();
           videoRef.current.onloadedmetadata = maybeStart;
 
-          // Start playing (required in some browsers to emit frames)
           try {
             await videoRef.current.play();
-          } catch (_err) {
-            /* autoplay blocked, user will need to interact */
-          }
+          } catch (_) {}
         }
       } catch (err) {
         setError("Could not access webcam. Please allow camera permissions.");
@@ -162,135 +114,384 @@ export default function Home() {
     };
   }, []);
 
-  // helper to lazily start vapi once
-  const ensureVapiStarted = async () => {
-    if (!vapiRef.current) return;
-    if (vapiRef.current.__started) return;
-    const pubKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
-    const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
-    if (!pubKey || !assistantId) return;
+  // Speak text using LMNT TTS (fetches audio bytes and plays in browser)
+  const speakText = async (text: string) => {
+    if (!text) return;
+
+    // Stop any previous playback
     try {
-      await vapiRef.current.start(assistantId, { microphone: { disabled: true } });
-      vapiRef.current.__started = true;
-      // attach again in case instance recreated
-      setIsSpeaking(false);
+      audioRef.current?.pause();
+      if (audioRef.current?.src) URL.revokeObjectURL(audioRef.current.src);
+    } catch (_) {}
+
+    const lmntKey = process.env.NEXT_PUBLIC_LMNT_API_KEY;
+    if (!lmntKey) {
+      console.error("Missing NEXT_PUBLIC_LMNT_API_KEY env var – cannot use LMNT TTS");
+      return;
+    }
+
+    const voiceId = process.env.NEXT_PUBLIC_LMNT_VOICE_ID || "lily";
+
+    try {
+      const res = await fetch("https://api.lmnt.com/v1/ai/speech/bytes", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": lmntKey,
+        },
+        body: JSON.stringify({ voice: voiceId, text, format: "mp3" }),
+      });
+
+      if (!res.ok) {
+        console.error("LMNT synth error", await res.text());
+        return;
+      }
+
+      const buffer = await res.arrayBuffer();
+      const blob = new Blob([buffer], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+
+      const audio = new Audio(url);
+      audioRef.current = audio;
+
+      // Flag speaking BEFORE playback to pause speech recognition immediately
+      setIsSpeaking(true);
+
+      // Abort recognition proactively (in case onplay delay)
+      try {
+        recognitionRef.current?.abort();
+      } catch (_) {}
+
+      // Setup volume analyser
+      try {
+        if (!audioCtxRef.current) {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        const ctx = audioCtxRef.current!;
+        const sourceNode = ctx.createMediaElementSource(audio);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        sourceNode.connect(analyser);
+        analyser.connect(ctx.destination);
+
+        const bufferLength = analyser.fftSize;
+        const dataArray = new Uint8Array(bufferLength);
+
+        const tick = () => {
+          if (!isSpeaking) return; // stop updates when done
+          analyser.getByteTimeDomainData(dataArray);
+          let sumSquares = 0;
+          for (let i = 0; i < bufferLength; i++) {
+            const normalized = (dataArray[i] - 128) / 128;
+            sumSquares += normalized * normalized;
+          }
+          const rms = Math.sqrt(sumSquares / bufferLength);
+          setVolumeLevel(rms); // 0..1
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      } catch (_) {
+        /* analyser might fail in insecure contexts */
+      }
+
+      audio.onplay = () => {}; // already flagged
+      audio.onended = () => {
+        setIsSpeaking(false);
+        URL.revokeObjectURL(url);
+        setVolumeLevel(0);
+      };
+      audio.onerror = () => setIsSpeaking(false);
+      await audio.play();
     } catch (err) {
-      console.error("Vapi start error", err);
+      console.error("LMNT playback error", err);
     }
   };
 
   const interruptSpeech = () => {
     try {
-      vapiRef.current?.stop();
+      audioRef.current?.pause();
     } catch (_) {}
     setIsSpeaking(false);
-    if (vapiRef.current) {
-      vapiRef.current.__started = false; // so next call will restart
-    }
   };
 
-  const askClaude = async () => {
-    if (!userText.trim()) return;
+  const recognitionRef = useRef<any>(null);
+  // Track last utterance to avoid duplicate sends
+  const lastUtteranceRef = useRef<string>("");
+
+  const sendToClaude = async (inputText: string, existingMessageId?: number) => {
+    if (!inputText.trim()) return;
+
+    // push user message into chat
+    let userId = existingMessageId;
+    if (userId == null) {
+      userId = captionIdRef.current++;
+      setChat((prev) => [
+        ...prev,
+        { id: userId!, role: "user" as const, text: inputText.trim() },
+      ]);
+    } else {
+      const text = inputText.trim();
+      setChat((prev) => prev.map((m) => (m.id === userId ? { ...m, text } : m)));
+    }
+
+    setUserText("");
     setLoadingClaude(true);
     setClaudeReply(null);
     setError(null);
+
     try {
       const res = await fetch("/api/claude", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ text: userText, emotion: topEmotions }),
+        body: JSON.stringify({ text: inputText, emotion: topEmotions, stream: true }),
       });
 
-      const data = await res.json();
-      if (data.completion) {
-        setClaudeReply(data.completion);
-        try {
-          await ensureVapiStarted();
-          vapiRef.current?.say?.(data.completion);
-        } catch (_) {}
-      } else if (data.error) {
-        setError(data.error);
+      if (!res.ok || !res.body) {
+        const errMsg = await res.text();
+        setError(errMsg);
+        return;
       }
+
+      // prepare assistant entry
+      const assistantId = captionIdRef.current++;
+      setChat((prev) => [...prev, { id: assistantId, role: "assistant" as const, text: "" }]);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        accumulated += decoder.decode(value, { stream: true });
+
+        // update assistant text in chat
+        setChat((prev) =>
+          prev.map((m) => (m.id === assistantId ? { ...m, text: accumulated } : m))
+        );
+      }
+
+      // Speak via transient voice-only call
+      await speakText(accumulated);
+
+      // Completed
+      setClaudeReply(accumulated);
+      lastAssistantTextRef.current = accumulated;
+
     } catch (err) {
+      console.error(err);
       setError("Failed to contact Claude API.");
     } finally {
       setLoadingClaude(false);
     }
   };
 
+  // Preserve original function for manual text input
+  const askClaude = () => sendToClaude(userText);
+
+  // SpeechRecognition setup (auto-start/stop)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    // @ts-ignore
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn("SpeechRecognition API not supported in this browser.");
+      return;
+    }
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "en-US";
+    recognitionRef.current = rec;
+
+    let currentMsgId: number | null = null;
+
+    rec.onresult = (e: any) => {
+      let interim = "";
+      let finalText = "";
+      for (let i = e.resultIndex; i < e.results.length; ++i) {
+        const res = e.results[i];
+        if (res.isFinal) finalText += res[0].transcript;
+        else interim += res[0].transcript;
+      }
+
+      if (currentMsgId === null) {
+        currentMsgId = captionIdRef.current++;
+        setChat((prev) => [...prev, { id: currentMsgId!, role: "user", text: "" }]);
+      }
+
+      const textToShow = finalText || interim;
+      setChat((prev) => prev.map((m) => (m.id === currentMsgId ? { ...m, text: textToShow } : m)));
+
+      if (finalText) {
+        // If the final text is essentially the same as what the assistant just said, skip (likely echo)
+        if (
+          lastAssistantTextRef.current &&
+          finalText.trim().toLowerCase().startsWith(lastAssistantTextRef.current.trim().slice(0, 20).toLowerCase())
+        ) {
+          // reset for next user utterance
+          currentMsgId = null;
+          return;
+        }
+        // Avoid sending duplicates
+        if (finalText.trim().toLowerCase() !== lastUtteranceRef.current.trim().toLowerCase()) {
+          sendToClaude(finalText, currentMsgId!);
+          lastUtteranceRef.current = finalText;
+        }
+        currentMsgId = null;
+      }
+    };
+
+    rec.onerror = (err: any) => {
+      console.error("Speech recog error", err);
+      setIsListening(false);
+    };
+
+    rec.onstart = () => setIsListening(true);
+    rec.onend = () => {
+      setIsListening(false);
+      // Auto-restart if assistant is not speaking
+      if (!isSpeaking) {
+        try {
+          rec.start();
+        } catch (_) {}
+      }
+    };
+
+    // Start listening initially (after permission prompt)
+    try {
+      rec.start();
+    } catch (_) {}
+
+    return () => {
+      rec.abort();
+    };
+  }, []); // run once
+
+  // Pause listening when assistant speaks to avoid feedback
+  useEffect(() => {
+    const rec: any = recognitionRef.current;
+    if (!rec) return;
+    try {
+      if (isSpeaking) {
+        if (rec) rec.abort();
+      } else if (!isListening) {
+        rec.start();
+      }
+    } catch (_) {}
+  }, [isSpeaking]);
+
   return (
-    <main className="flex flex-col items-center gap-6 py-10">
-      <h1 className="text-2xl font-semibold">Hume Face Emotion Demo</h1>
+    <main className="container mx-auto max-w-5xl py-10 space-y-10 relative">
+      <h1 className="text-3xl font-bold text-center">Empathic Sign-Language Therapy Assistant</h1>
 
-      {error && (
-        <p className="text-red-600 max-w-md text-center">{error}</p>
-      )}
+      {error && <p className="text-red-600 text-center">{error}</p>}
 
-      <video
-        ref={videoRef}
-        autoPlay
-        muted
-        playsInline
-        width={320}
-        height={240}
-        className="rounded shadow-md bg-black"
-      />
+      <div className="grid md:grid-cols-2 gap-8">
+        {/* Camera + emotion card */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Live Emotion Detection</CardTitle>
+            <CardDescription>Webcam video analysed by Hume AI</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex justify-center">
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                width={320}
+                height={240}
+                className="rounded bg-black shadow" />
+              {/* Hidden canvas for captures */}
+              <canvas ref={canvasRef} width={320} height={240} className="hidden" />
+            </div>
 
-      {/* Hidden canvas used for frame captures */}
-      <canvas ref={canvasRef} width={320} height={240} className="hidden" />
+            <div className="text-center">
+              <h3 className="font-medium">Top emotions</h3>
+              {topEmotions ? (
+                <ul className="mt-2 space-y-1">
+                  {topEmotions.map((e) => (
+                    <li key={e.name} className="text-sm">
+                      {e.name}: {(e.score * 100).toFixed(1)}%
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-gray-500">Looking for faces…</p>
+              )}
+            </div>
+          </CardContent>
+        </Card>
 
-      <section className="mt-4 text-center">
-        <h2 className="font-medium mb-2">Top emotions</h2>
-        {topEmotions ? (
-          <ul className="space-y-1">
-            {topEmotions.map((e) => (
-              <li key={e.name} className="text-lg">
-                {e.name}: {(e.score * 100).toFixed(1)}%
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-sm text-gray-500">Looking for faces…</p>
-        )}
-      </section>
+        {/* Chat card */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Chat with Claude</CardTitle>
+            <CardDescription>Craft empathetic responses to your intent</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {/* Chat message stream */}
+            <div className="h-80 overflow-y-auto mb-4 space-y-2">
+              {chat.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`rounded-lg px-3 py-2 max-w-[80%] whitespace-pre-wrap break-words text-sm shadow
+                    ${msg.role === "user" ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-900"}`}
+                  >
+                    {msg.text || (msg.role === "assistant" ? "…" : "")}
+                  </div>
+                </div>
+              ))}
+              <div ref={chatEndRef} />
+            </div>
 
-      {/* Claude text box */}
-      <section className="mt-10 w-full max-w-xl">
-        <h2 className="font-medium mb-2 text-center">Chat with Claude</h2>
-        <textarea
-          className="w-full border rounded p-2 text-sm text-gray-900 dark:text-gray-100 bg-white dark:bg-gray-800"
-          rows={4}
-          placeholder="Type a message for Claude..."
-          value={userText}
-          onChange={(e) => setUserText(e.target.value)}
+            {/* Controls */}
+            <div className="flex flex-col gap-2">
+              <Textarea
+                rows={3}
+                placeholder="Optional: Type a message..."
+                value={userText}
+                onChange={(e) => setUserText(e.target.value)}
+              />
+
+              <div className="flex justify-end gap-3">
+                {isSpeaking && (
+                  <Button className="bg-red-600 hover:bg-red-600/90" onClick={interruptSpeech}>
+                    Interrupt
+                  </Button>
+                )}
+                {isListening && (
+                  <span className="text-sm text-gray-500 self-center mr-2">Listening…</span>
+                )}
+                <Button onClick={askClaude} disabled={loadingClaude}>
+                  {loadingClaude ? "Sending..." : "Send"}
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Speaking indicator */}
+      <div className="pointer-events-none fixed bottom-6 right-6 z-50">
+        <div
+          className={`rounded-full bg-blue-600/80 shadow-lg transition-all duration-150 ${
+            isSpeaking ? "w-16 h-16 opacity-100 animate-pulse" : "w-8 h-8 opacity-0"
+          }`}
+          style={{
+            transform: `scale(${isSpeaking ? 1 + volumeLevel : 1})`,
+          }}
         />
-        <div className="flex justify-end mt-2">
-          <button
-            onClick={askClaude}
-            className="px-4 py-2 rounded bg-blue-600 text-white disabled:opacity-50"
-            disabled={loadingClaude}
-          >
-            {loadingClaude ? "Sending..." : "Send"}
-          </button>
-
-          {isSpeaking && (
-            <button
-              onClick={interruptSpeech}
-              className="ml-4 px-4 py-2 rounded bg-red-600 text-white"
-            >
-              Interrupt
-            </button>
-          )}
-        </div>
-
-        {claudeReply && (
-          <div className="mt-4 p-4 border rounded bg-gray-50 dark:bg-gray-900 dark:border-gray-700 whitespace-pre-wrap">
-            {claudeReply}
-          </div>
-        )}
-      </section>
+      </div>
     </main>
   );
 }
