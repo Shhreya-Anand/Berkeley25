@@ -18,11 +18,97 @@ export default function Home() {
   useEffect(() => {
     let localStream: MediaStream;
 
+    const apiKey = process.env.NEXT_PUBLIC_HUME_API_KEY;
+
+    const startStreaming = () => {
+      if (!apiKey) {
+        setError("Missing NEXT_PUBLIC_HUME_API_KEY env var.");
+        return;
+      }
+
+      if (!videoRef.current || !canvasRef.current) return;
+
+      const socket = new WebSocket(
+        `wss://api.hume.ai/v0/stream/models?apikey=${apiKey}`
+      );
+
+      socket.onopen = () => {
+        console.debug("Hume socket opened");
+      };
+
+      socket.onerror = (ev) => {
+        console.error("WS errored", ev);
+        setError("WebSocket connection error.");
+      };
+
+      socket.onmessage = (event) => {
+        console.debug("WS message", event.data);
+        try {
+          const data = JSON.parse(event.data);
+          const emotions: EmotionScore[] | undefined = data?.face?.predictions?.[0]?.emotions;
+          if (emotions) {
+            const top = [...emotions]
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 3);
+            setTopEmotions(top);
+          }
+        } catch (_) {
+          /* swallow parse errors */
+        }
+      };
+
+      // Capture frames every 800 ms (≈1.25 fps)
+      const captureInterval = setInterval(() => {
+        if (!videoRef.current || !canvasRef.current) return;
+        const ctx = canvasRef.current.getContext("2d");
+        if (!ctx) return;
+
+        // Draw current frame onto canvas (scale down for bandwidth)
+        ctx.drawImage(videoRef.current, 0, 0, 320, 240);
+        const jpegBase64 = canvasRef.current
+          .toDataURL("image/jpeg", 0.7)
+          .replace(/^data:image\/jpeg;base64,/, "");
+
+        if (socket.readyState === WebSocket.OPEN) {
+          const payload = {
+            data: jpegBase64,
+            models: { face: {} },
+          };
+          socket.send(JSON.stringify(payload));
+        } else {
+          console.debug("Socket not open, state", socket.readyState);
+        }
+      }, 800);
+
+      return () => {
+        clearInterval(captureInterval);
+        socket.close();
+      };
+    };
+
     const enableCamera = async () => {
       try {
         localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         if (videoRef.current) {
           videoRef.current.srcObject = localStream;
+
+          const maybeStart = () => {
+            // HAVE_CURRENT_DATA == 2
+            if (videoRef.current && videoRef.current.readyState >= 2) {
+              startStreaming();
+            }
+          };
+
+          // If metadata already loaded (rare), start immediately, else wait.
+          maybeStart();
+          videoRef.current.onloadedmetadata = maybeStart;
+
+          // Start playing (required in some browsers to emit frames)
+          try {
+            await videoRef.current.play();
+          } catch (_err) {
+            /* autoplay blocked, user will need to interact */
+          }
         }
       } catch (err) {
         setError("Could not access webcam. Please allow camera permissions.");
@@ -33,68 +119,6 @@ export default function Home() {
 
     return () => {
       localStream?.getTracks().forEach((t) => t.stop());
-    };
-  }, []);
-
-  // Connect to Hume when API key exists and camera ready
-  useEffect(() => {
-    const apiKey = process.env.NEXT_PUBLIC_HUME_API_KEY;
-    if (!apiKey) {
-      setError("Missing NEXT_PUBLIC_HUME_API_KEY env var.");
-      return;
-    }
-
-    // Only run in browser after canvas/video refs available
-    if (!videoRef.current || !canvasRef.current) return;
-
-    const socket = new WebSocket(
-      `wss://api.hume.ai/v0/stream/models?api_key=${apiKey}`
-    );
-
-    socket.onopen = () => {
-      // Tell Hume we want facial expression predictions
-      socket.send(JSON.stringify({ models: { face: {} } }));
-    };
-
-    socket.onerror = () => setError("WebSocket connection error.");
-
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        const emotions: EmotionScore[] | undefined = data?.face?.predictions?.[0]?.emotions;
-        if (emotions) {
-          const top = [...emotions]
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 3);
-          setTopEmotions(top);
-        }
-      } catch (_) {
-        /* swallow parse errors */
-      }
-    };
-
-    // Capture frames every 800 ms (≈1.25 fps)
-    const captureInterval = setInterval(() => {
-      if (!videoRef.current || !canvasRef.current) return;
-      const ctx = canvasRef.current.getContext("2d");
-      if (!ctx) return;
-
-      // Draw current frame onto canvas (scale down for bandwidth)
-      ctx.drawImage(videoRef.current, 0, 0, 320, 240);
-      const jpegBase64 = canvasRef.current
-        .toDataURL("image/jpeg", 0.7)
-        .replace(/^data:image\/jpeg;base64,/, "");
-
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(
-          JSON.stringify({ data: jpegBase64, raw_image: true })
-        );
-      }
-    }, 800);
-
-    return () => {
-      clearInterval(captureInterval);
-      socket.close();
     };
   }, []);
 
