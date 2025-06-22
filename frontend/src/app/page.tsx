@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+// @ts-ignore -- Vapi has no TS types yet
+import Vapi from "@vapi-ai/web";
 
 interface EmotionScore {
   name: string;
@@ -13,6 +15,44 @@ export default function Home() {
 
   const [topEmotions, setTopEmotions] = useState<EmotionScore[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Claude interaction state
+  const [userText, setUserText] = useState("");
+  const [claudeReply, setClaudeReply] = useState<string | null>(null);
+  const [loadingClaude, setLoadingClaude] = useState(false);
+
+  // Track Vapi speaking state for interrupt button
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  // Vapi reference
+  const vapiRef = useRef<any>(null);
+
+  // Init Vapi once in browser
+  useEffect(() => {
+    const pubKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
+    const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
+
+    if (!pubKey || !assistantId) return; // skip if env vars missing
+
+    const v = new Vapi(pubKey);
+    vapiRef.current = v;
+
+    // Start persistent call so we can stream "say" later
+    v.start(assistantId);
+
+    // Wire speech events to toggle isSpeaking
+    v.on("speech-start", () => setIsSpeaking(true));
+    v.on("speech-end", () => setIsSpeaking(false));
+
+    return () => {
+      try {
+        v.stop();
+        setIsSpeaking(false);
+      } catch (_) {
+        /* no-op */
+      }
+    };
+  }, []);
 
   // Ask for webcam on mount
   useEffect(() => {
@@ -122,6 +162,64 @@ export default function Home() {
     };
   }, []);
 
+  // helper to lazily start vapi once
+  const ensureVapiStarted = async () => {
+    if (!vapiRef.current) return;
+    if (vapiRef.current.__started) return;
+    const pubKey = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY;
+    const assistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
+    if (!pubKey || !assistantId) return;
+    try {
+      await vapiRef.current.start(assistantId, { microphone: { disabled: true } });
+      vapiRef.current.__started = true;
+      // attach again in case instance recreated
+      setIsSpeaking(false);
+    } catch (err) {
+      console.error("Vapi start error", err);
+    }
+  };
+
+  const interruptSpeech = () => {
+    try {
+      vapiRef.current?.stop();
+    } catch (_) {}
+    setIsSpeaking(false);
+    if (vapiRef.current) {
+      vapiRef.current.__started = false; // so next call will restart
+    }
+  };
+
+  const askClaude = async () => {
+    if (!userText.trim()) return;
+    setLoadingClaude(true);
+    setClaudeReply(null);
+    setError(null);
+    try {
+      const res = await fetch("/api/claude", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: userText, emotion: topEmotions }),
+      });
+
+      const data = await res.json();
+      if (data.completion) {
+        setClaudeReply(data.completion);
+        try {
+          await ensureVapiStarted();
+          vapiRef.current?.say?.(data.completion);
+        } catch (_) {}
+      } else if (data.error) {
+        setError(data.error);
+      }
+    } catch (err) {
+      setError("Failed to contact Claude API.");
+    } finally {
+      setLoadingClaude(false);
+    }
+  };
+
   return (
     <main className="flex flex-col items-center gap-6 py-10">
       <h1 className="text-2xl font-semibold">Hume Face Emotion Demo</h1>
@@ -155,6 +253,42 @@ export default function Home() {
           </ul>
         ) : (
           <p className="text-sm text-gray-500">Looking for faces…</p>
+        )}
+      </section>
+
+      {/* Claude text box */}
+      <section className="mt-10 w-full max-w-xl">
+        <h2 className="font-medium mb-2 text-center">Chat with Claude</h2>
+        <textarea
+          className="w-full border rounded p-2 text-sm text-gray-900 dark:text-gray-100 bg-white dark:bg-gray-800"
+          rows={4}
+          placeholder="Type a message for Claude..."
+          value={userText}
+          onChange={(e) => setUserText(e.target.value)}
+        />
+        <div className="flex justify-end mt-2">
+          <button
+            onClick={askClaude}
+            className="px-4 py-2 rounded bg-blue-600 text-white disabled:opacity-50"
+            disabled={loadingClaude}
+          >
+            {loadingClaude ? "Sending..." : "Send"}
+          </button>
+
+          {isSpeaking && (
+            <button
+              onClick={interruptSpeech}
+              className="ml-4 px-4 py-2 rounded bg-red-600 text-white"
+            >
+              Interrupt
+            </button>
+          )}
+        </div>
+
+        {claudeReply && (
+          <div className="mt-4 p-4 border rounded bg-gray-50 dark:bg-gray-900 dark:border-gray-700 whitespace-pre-wrap">
+            {claudeReply}
+          </div>
         )}
       </section>
     </main>

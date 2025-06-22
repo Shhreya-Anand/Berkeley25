@@ -52,3 +52,11 @@ npm run dev
 ```
 
 3. Open `http://localhost:3000` – allow camera permissions and observe live emotion predictions.
+
+## Claude Chat
+
+The homepage also includes a simple Claude chat box.
+
+1. Ensure `CLAUDE_API_KEY` is set in your `.env.local` (as shown above).
+2. (Optional) Specify `CLAUDE_MODEL` (e.g. `claude-3-haiku-20240307`). Defaults to Haiku if not set.
+3. Type a prompt and press **Send** – the response will render below the box.
